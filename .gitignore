@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
+
+# experiment artefacts
+*.pth
+*.pth.tar
+*.ckpt
+work_dirs/
+output/
+output_dir/
+log/
+*.log
+events.out.tfevents.*
+
+# data
+data/
+datasets/
+*.zip
+
+# envs / editors
+.venv/
+.env
+.idea/
+.vscode/

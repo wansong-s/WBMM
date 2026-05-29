@@ -1,0 +1,18 @@
+# Image-classification requirements (root folder).
+# Detection / segmentation have their own extra deps (mmcv / mmdet / mmseg);
+# see detection/README.md and segmentation/README.md.
+#
+# WBMM uses ordinary matrix multiplication for its window operator, so NO
+# custom CUDA / cutlass / iGEMM large-kernel extension is required.
+torch>=1.10.0
+torchvision>=0.9.0
+timm==0.6.11
+numpy
+opencv-python
+termcolor
+yacs
+pyyaml
+scipy
+huggingface_hub
+tensorboardX
+six
