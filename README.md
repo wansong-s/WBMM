@@ -26,6 +26,8 @@
   </a>
 </p>
 
+> 🎉 **This work has been accepted to ICML 2026 as a Spotlight paper.**
+
 WBMM replaces the expensive large-kernel depth-wise convolution with a
 **windowed batched matrix multiplication**: inside each local window the feature
 map is multiplied by a position-dependent matrix built from a small
@@ -441,10 +443,14 @@ numerically rather than only in prose.
 ## Citation
 
 ```bibtex
-@article{wbmm,
-  title  = {WBMM: Windowed Batch Matrix Multiplication for Efficient Large Receptive Field Convolution},
-  author = {Wang, Song and others},
-  year   = {2025}
+@article{wan2026wbmm,
+  title         = {WBMM: Windowed Batch Matrix Multiplication for Efficient Large Receptive Field Convolution},
+  author        = {Song, Wan and Zhou, Wei and Wang, Rui and Yu, Jun and Kurihara, Toru and Xu, Jiajia and Zhan, Shu},
+  journal       = {arXiv preprint arXiv:2607.02097},
+  year          = {2026},
+  eprint        = {2607.02097},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV}
 }
 ```
 
