@@ -26,7 +26,7 @@ model = dict(
         drop_path_rate=0.3,
         kernel_sizes=None,  # use default kernel size
         with_cp=True,       # to save GPU memory
-        init_cfg=dict(type='Pretrained', checkpoint='wbmm_s_dense_in1k_224_w7.pth')
+        init_cfg=dict(type='Pretrained', checkpoint='wbmm_s_in1k_224_dense_w7.pth')
     ),
     decode_head=dict(num_classes=150, in_channels=dims),
     auxiliary_head=dict(num_classes=150, in_channels=dims[2]),
