@@ -19,7 +19,7 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 dims = [96, 192, 384, 768]
-pretrained = 'wbmm_s_dense_in1k_224_w7.pth'  # WBMM dense-task ImageNet backbone (upload to HF)
+pretrained = 'wbmm_s_in1k_224_dense_w7.pth'  # WBMM dense-task ImageNet backbone (upload to HF)
 model = dict(
     backbone=dict(
         _delete_=True,
