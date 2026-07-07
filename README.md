@@ -5,6 +5,14 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2607.02097">
+    <img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?style=flat-square&logo=arxiv&logoColor=white" alt="Paper">
+  </a>
+  &nbsp;
+  <a href="https://arxiv.org/pdf/2607.02097">
+    <img src="https://img.shields.io/badge/PDF-Download-b31b1b?style=flat-square&logo=adobeacrobatreader&logoColor=white" alt="PDF">
+  </a>
+  &nbsp;
   <a href="https://github.com/wansong-s/WBMM">
     <img src="https://img.shields.io/badge/Code-GitHub-181717?style=flat-square&logo=github&logoColor=white" alt="Code">
   </a>
@@ -146,6 +154,16 @@ python -m torch.distributed.launch --nproc_per_node=8 main.py \
   --data_path /path/to/imagenet-1k
 ```
 
+> The commands above evaluate the **original, un-fused** checkpoint only —
+> `main.py` builds its model from [`wbmm.py`](wbmm.py) and calls a strict
+> `model.load_state_dict()`, so it cannot load a *fused* checkpoint (its keys
+> differ: `R_fused`/`bias_fused` or `M_fused`/`bias_fused` instead of
+> `relative_position_bias_table` + BatchNorm stats). To get real Top-1/Top-5
+> for the two fused checkpoints `reparameterize.py` produces
+> (`deploy_nocache` and `deploy_cache`), use [`eval_deploy.py`](eval_deploy.py)
+> instead — see **"Evaluate the fused checkpoints"** under
+> "Reparameterization for inference" below.
+
 ## ImageNet-1K training
 
 The recipe is **identical to UniRepLKNet** (that is the point — see the fairness
@@ -251,6 +269,173 @@ y  = op(x)                      # same shape
 from wbmm import wbmm_t
 model = wbmm_t(in_1k_pretrained=True)   # auto-downloads wbmm_t_in1k_224_w7.pth from HF
 ```
+
+## Reparameterization for inference (BatchNorm / multi-kernel fusion)
+
+> **New files, unchanged training.** The fusion machinery below lives in
+> three new files: [`wbmm_reparam.py`](wbmm_reparam.py),
+> [`reparameterize.py`](reparameterize.py), and
+> [`eval_deploy.py`](eval_deploy.py) (real-accuracy evaluation for the fused
+> checkpoints — see "Evaluate the fused checkpoints" below).
+> [`wbmm.py`](wbmm.py) and `main.py` are untouched — training, and the
+> "ImageNet evaluation" commands above, still work exactly as before.
+> `wbmm_reparam.py` is `wbmm.py` plus this inference-time machinery layered
+> on top (identical trainable parameters, same names and shapes), so it
+> loads any checkpoint `main.py` produces without modification — see
+> [`tests/test_equivalence.py`](tests/test_equivalence.py) for the numerical
+> proof. The two model files register the same timm model names, so import
+> only one of them per process (`wbmm_reparam.py`'s own module docstring
+> explains why; `eval_deploy.py` and `reparameterize.py` both already follow
+> this rule by only ever importing `wbmm_reparam`).
+
+Every WBMM ('W') block is wrapped in a BatchNorm (`WBMMBlock.norm`); the S4
+stage of WBMM-P / WBMM-N additionally fuses two parallel depthwise paths
+(`Sec. 3.7`: `BN1(WBMM(x)+x) + BN2(DW5(x)) + BN3(DW3(x))`); and every block's
+FFN projection (`pwconv2`) ends in a BatchNorm too. At inference, all of this
+is *pure linear algebra applied to a fixed input* — no batch statistics are
+computed — so it can be folded, once and for all, directly into the WBMM
+table/matrix / conv kernel / linear weights it feeds. `reparameterize_wbmm()`
+methods (added to `wbmm`, `WBMMBlock` in `wbmm_reparam.py`) do exactly this,
+into **one of two interchangeable deploy targets** you choose with a `cache`
+flag.
+
+Shapes used below (`C` = channels, `d = wh*ww` = elements per window): `I` is
+the `(d, d)` `relative_position_index` buffer (see
+`wbmm._get_relative_position_index`) — **not** flattened — so `R_fused[:, I]`
+is ordinary PyTorch/NumPy advanced indexing that already returns the dense
+`(C, d, d)` matrix, identical to `torch.index_select(R_fused, 1,
+I.flatten()).view(C, d, d)` (exactly what `wbmm._build_matrix` computes; both
+forms are equal element-for-element). `bias_fused` is `(C,)` and must
+broadcast as a per-channel scalar over the window-batched `(C, N, d)` input
+(`N` = batch × number of windows) — i.e. `bias_fused[:, None, None]`
+(`.view(C, 1, 1)` in the code) — a bare `+ bias_fused` does **not** broadcast
+against a `(C, N, d)` tensor and raises a shape-mismatch error, so the tables
+below always show it reshaped:
+
+| before fusion | after fusion, default (`cache=False`) | after fusion, `--cache` (`cache=True`) |
+|:--------------|:---------------------------------------|:-----------------------------------------|
+| `BN1(WBMM(x)+x) + BN2(DW5(x)) + BN3(DW3(x))` (S4 of P/N) | `x @ R_fused[:, I] + bias_fused[:, None, None]` | `x @ M_fused + bias_fused[:, None, None]` |
+| `BN( WBMM(x) + x )` (any other 'W' block)                | `x @ R_fused[:, I] + bias_fused[:, None, None]` | `x @ M_fused + bias_fused[:, None, None]` |
+| `BN( DWConv(x) )` ('D' blocks)                            | `Conv2d(x)` (bias folded in)     | *(same — no WBMM operator here)* |
+| `BN( Linear(x) )` (`pwconv2`, every block)                | `Linear(x)` (bias folded in)     | *(same)* |
+
+(`x` itself is reshaped/permuted to `(C, N, d)` before the matmul and back to
+`(B, C, H, W)` after, exactly as the un-fused forward pass already does — see
+`wbmm.forward` / `wbmm._forward_deployed` for the literal reshape/permute
+calls either side of the matmul.)
+
+Both targets fold BatchNorm, the shortcut, and (at S4) the two extra
+depthwise branches into the *same* compact `(C,(2w-1)^2)` relative-position
+table every WBMM block already had (renamed `R_fused`) plus one new small
+`(C,)` `bias_fused` — nothing bigger ever replaces what fusion deletes, so
+the **default target is always smaller** than the checkpoint you started
+from. `--cache` takes that compact `R_fused` one step further and expands it
+into a dense `(C,d,d)` `M_fused` (Sec. 3.4.5's WBMM-C matrix), removing the
+per-call `index_select` entirely — but a dense `d^2`-per-channel matrix is
+usually bigger than the compact `(2w-1)^2`-per-channel table it replaces (7x7
+window: 169 -> 2401 per channel, ~14x), so **this target is usually larger**
+than the checkpoint you started from, despite deleting the same BatchNorm.
+Pick the default if you want the smallest possible checkpoint and don't mind
+`index_select`; pick `--cache` if you want to remove `index_select` from
+every forward call and can afford the larger checkpoint. See "What you get"
+below for the numbers, and [`wbmm_reparam.py`](wbmm_reparam.py)'s
+`wbmm.reparameterize_wbmm` docstring for the full derivation of why the
+shortcut/BatchNorm/multi-kernel fold into the compact table just as cleanly
+as into the dense one.
+
+This is **lossless** either way: both fused models reproduce the original
+model's output bit-for-bit up to floating point rounding (empirically ~1e-7
+relative error in fp32 across full WBMM-P/N/T/S forward passes — see
+[`tests/test_equivalence.py`](tests/test_equivalence.py)), and therefore
+agree with *each other* too (`test_deploy_nocache_and_cache_agree`). It is
+also *why* window size 7 and 14 aren't arbitrary: WBMM run with a `w x w`
+window is *exactly* a depthwise conv of size `(2w-1) x (2w-1)` applied
+independently inside each non-overlapping window (Theorem 3.1 + 3.2, Sec.
+3.3) — `w=7 <=> 13x13` (UniRepLKNet's own "optimal" size) and `w=14 <=>
+27x27`, the two large-kernel sizes the paper's own operator benchmarks
+compare against. [`tests/test_equivalence.py`](tests/test_equivalence.py)
+contains a runnable, from-scratch numerical proof of this
+(`test_theorem_3_2_conv_equals_matmul`, `test_theorem_3_1_excess_kernel_is_inert`,
+`test_window_equals_local_large_kernel`).
+
+**Convert a trained checkpoint** (default target: compact, smaller file —
+saved here with a `_deploy_nocache` suffix, matching the `fmt` string
+`load_any_checkpoint` reports for it):
+```bash
+python reparameterize.py \
+  --model wbmm_t --checkpoint wbmm_t_in1k_224_w7.pth \
+  --output wbmm_t_in1k_224_w7_deploy_nocache.pth --check
+```
+...or the `--cache` target: no `index_select` left at inference, usually a
+larger file (`_deploy_cache` suffix):
+```bash
+python reparameterize.py \
+  --model wbmm_t --checkpoint wbmm_t_in1k_224_w7.pth \
+  --output wbmm_t_in1k_224_w7_deploy_cache.pth --cache --check
+```
+
+**Evaluate the fused checkpoints** (real ImageNet-1K Top-1/Top-5, not just
+the `--check` flag's random-input sanity check above): `main.py --eval`
+cannot load either fused checkpoint directly, since it always builds the
+un-fused architecture from [`wbmm.py`](wbmm.py) — use
+[`eval_deploy.py`](eval_deploy.py) instead, which shares the exact same
+dataset/transform (`datasets.py`) and evaluation loop (`engine.evaluate`), so
+the numbers are directly comparable:
+```bash
+# fused, compact (deploy_nocache)
+python eval_deploy.py --model wbmm_t \
+  --resume wbmm_t_in1k_224_w7_deploy_nocache.pth --input_size 224 \
+  --data_path /path/to/imagenet-1k
+
+# fused, dense (deploy_cache)
+python eval_deploy.py --model wbmm_t \
+  --resume wbmm_t_in1k_224_w7_deploy_cache.pth --input_size 224 \
+  --data_path /path/to/imagenet-1k
+
+# 8 GPUs, either checkpoint
+python -m torch.distributed.launch --nproc_per_node=8 eval_deploy.py \
+  --model wbmm_t --resume wbmm_t_in1k_224_w7_deploy_nocache.pth \
+  --input_size 224 --data_path /path/to/imagenet-1k
+```
+`eval_deploy.py` auto-detects the checkpoint format
+(`probe_checkpoint_format`) and builds whichever architecture matches, so the
+same command also accepts the *original* `wbmm_t_in1k_224_w7.pth` and
+reproduces `main.py --eval true`'s Acc@1/Acc@5 exactly. All three checkpoints
+(original, `deploy_nocache`, `deploy_cache`) should report the same accuracy
+up to float rounding — that agreement is the real-data confirmation that
+fusion is lossless, on top of the synthetic proof in
+[`tests/test_equivalence.py`](tests/test_equivalence.py).
+
+
+
+**What you get:** fusing collapses the S4 multi-kernel block (4 BatchNorms +
+2 extra depthwise convs) into a single table/matrix lookup, and every other
+WBMM block loses its BatchNorm the same way, so each fused block does
+strictly less work than its un-fused counterpart — how much that moves
+whole-network latency depends on your hardware and how much of it is spent
+elsewhere (downsample/FFN layers, kernel-launch and BatchNorm overhead are
+typically more prominent on GPU than on CPU). Storage moves in **opposite directions** depending on which
+target you pick: the **default** folds everything directly into the
+*existing* compact `(2w-1)^2`-per-channel table (`R_fused`, same shape as
+before) plus one new small `(C,)` bias — nothing bigger ever replaces what
+fusion deletes, so both nn.Parameter count *and* total stored-tensor count
+strictly **decrease**, and the checkpoint file gets **smaller**. `--cache`
+additionally expands that same table into a dense `(C,d,d)` `M_fused`
+*buffer*, so while nn.Parameter count still drops slightly (BatchNorm affine
+params still disappear), total stored-tensor count — and file size — usually
+goes **up**: for a 7x7 window, `(2*7-1)^2=169` per channel becomes
+`49*49=2401` per channel, roughly 14x larger for every WBMM block's matrix,
+which dominates the BatchNorm savings. nn.Parameter count alone is a
+misleading proxy for the resulting file size in *either* direction,
+precisely because `R_fused` / `M_fused` are buffers, not `nn.Parameter`s —
+the conversion script's own printout reports nn.Parameter count, total
+stored-tensor count, and the actual before/after file size side by side,
+with a target-specific explanation of which way and why, so this isn't easy
+to miss. [`tests/test_equivalence.py`](tests/test_equivalence.py)'s
+`test_nocache_fusion_strictly_shrinks_storage` and
+`test_cache_fusion_grows_storage_for_window7` assert exactly this trade-off
+numerically rather than only in prose.
+
 
 
 ## Citation
